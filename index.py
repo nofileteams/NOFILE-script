@@ -5,8 +5,7 @@ import time
 import shutil
 import random as _random
 import subprocess
-import urllib.request
-import urllib.error
+import zipfile
 
 try:
     import msvcrt
@@ -290,15 +289,38 @@ def handle_random(left, target):
     write_result(text, target)
 
 
-def handle_req(left, target):
-    m = re.match(r'^req\((.*)\)$', left)
-    url = resolve(m.group(1))
+def handle_copy(left, target):
+    m = re.match(r'^copy\(\s*(.+?)\s+to\s+(.+?)\s*\)$', left)
+    src = resolve(m.group(1))
+    dst = resolve(m.group(2))
     try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            body = resp.read().decode('utf-8', errors='ignore')
-        write_result(body, target)
+        if os.path.isdir(src):
+            dst_final = dst if not os.path.isdir(dst) else os.path.join(dst, os.path.basename(src))
+            shutil.copytree(src, dst_final)
+        else:
+            d = os.path.dirname(dst)
+            if d and not os.path.isdir(d):
+                os.makedirs(d)
+            shutil.copy2(src, dst)
+        result = "true"
     except Exception:
-        print("error")
+        result = "error"
+    if target:
+        write_result(result, target)
+
+
+def handle_unzip(left, target):
+    m = re.match(r'^unzip\((.*)\)$', left)
+    path = resolve(m.group(1))
+    try:
+        dest = os.path.dirname(path) or '.'
+        with zipfile.ZipFile(path, 'r') as zf:
+            zf.extractall(dest)
+        result = "true"
+    except Exception:
+        result = "error"
+    if target:
+        write_result(result, target)
 
 
 def dispatch_cmd_for_path(path):
@@ -441,8 +463,10 @@ def execute_statement(line):
         handle_sleep(left)
     elif re.match(r'^random\s*=', left):
         handle_random(left, target)
-    elif left.startswith('req('):
-        handle_req(left, target)
+    elif re.match(r'^copy\s*\(', left):
+        handle_copy(left, target)
+    elif re.match(r'^unzip\(', left):
+        handle_unzip(left, target)
     elif re.match(r'^start\.file\(', left):
         handle_start_file(left, target)
     elif re.match(r'^start\.cmd\(', left):
