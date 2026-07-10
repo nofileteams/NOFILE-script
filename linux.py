@@ -5,18 +5,23 @@ import time
 import shutil
 import random as _random
 import subprocess
-import termios
-import tty
-import urllib.request
-import urllib.error
+import zipfile
+import stat
+
+try:
+    import termios
+    import tty
+except ImportError:
+    termios = None
+    tty = None
 
 VARS = {}
 LABELS = {}
 
 VAR_PATTERN = re.compile(r'\$([A-Za-z0-9_]+)\$')
 
-# アドオン用ディレクトリ（Linux向け。必要に応じて変更してください）
-ADDON_DIR = os.path.join(os.path.expanduser('~'), '.local', 'share', 'nfile', 'addon')
+# Linuxではユーザーごとの共有ディレクトリにaddonを置く運用とする
+ADDON_DIR = os.path.join(os.path.expanduser('~'), '.local', 'share', 'nscript', 'addon')
 
 
 class Goto(Exception):
@@ -290,30 +295,57 @@ def handle_random(left, target):
     write_result(text, target)
 
 
-def handle_req(left, target):
-    m = re.match(r'^req\((.*)\)$', left)
-    url = resolve(m.group(1))
+def handle_copy(left, target):
+    m = re.match(r'^copy\(\s*(.+?)\s+to\s+(.+?)\s*\)$', left)
+    src = resolve(m.group(1))
+    dst = resolve(m.group(2))
     try:
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            body = resp.read().decode('utf-8', errors='ignore')
-        write_result(body, target)
+        if os.path.isdir(src):
+            dst_final = dst if not os.path.isdir(dst) else os.path.join(dst, os.path.basename(src))
+            shutil.copytree(src, dst_final)
+        else:
+            d = os.path.dirname(dst)
+            if d and not os.path.isdir(d):
+                os.makedirs(d)
+            shutil.copy2(src, dst)
+        result = "true"
     except Exception:
-        print("error")
+        result = "error"
+    if target:
+        write_result(result, target)
+
+
+def handle_unzip(left, target):
+    m = re.match(r'^unzip\((.*)\)$', left)
+    path = resolve(m.group(1))
+    try:
+        dest = os.path.dirname(path) or '.'
+        with zipfile.ZipFile(path, 'r') as zf:
+            zf.extractall(dest)
+        result = "true"
+    except Exception:
+        result = "error"
+    if target:
+        write_result(result, target)
 
 
 def dispatch_cmd_for_path(path):
-    """実行ファイルの種類に応じたコマンドを返す（Linux向け）。"""
+    """実行対象ファイルに応じたコマンド列を組み立てる（Linux版）。"""
     ext = os.path.splitext(path)[1].lower()
     if ext == '.py':
         return [sys.executable, path]
     if ext == '.sh':
         return ['bash', path]
-    if ext == '.ps1':
-        # PowerShell Core (pwsh) がインストールされている前提
-        return ['pwsh', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path]
-    if os.access(path, os.X_OK):
-        return [path]
-    # 実行権限が無い場合は bash 経由で実行を試みる
+    if ext == '.pl':
+        return ['perl', path]
+    # 拡張子なし、あるいはその他の場合は実行権限を確認する
+    try:
+        st = os.stat(path)
+        if st.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+            return [path]
+    except OSError:
+        pass
+    # 実行権限がなければ bash 経由で試す
     return ['bash', path]
 
 
@@ -335,15 +367,15 @@ def handle_start_file(left, target):
 
 
 def handle_start_cmd(left, target):
-    """start.cmd(...) : シェルコマンドを /bin/sh -c 経由で実行する。"""
+    """start.cmd(...) は Linux では既定のシェル (bash -c) で実行する。"""
     m = re.match(r'^start\.cmd\((.*)\)$', left)
     cmdtext = sub_vars(strip_quotes(m.group(1).strip()))
     try:
         if target:
-            completed = subprocess.run(['/bin/sh', '-c', cmdtext], capture_output=True, text=True)
+            completed = subprocess.run(['bash', '-c', cmdtext], capture_output=True, text=True)
             write_result(completed.stdout.rstrip('\n'), target)
         else:
-            subprocess.run(['/bin/sh', '-c', cmdtext])
+            subprocess.run(['bash', '-c', cmdtext])
     except Exception:
         if target:
             write_result("error", target)
@@ -352,15 +384,23 @@ def handle_start_cmd(left, target):
 
 
 def handle_start_pwsh(left, target):
-    """start.pwsh(...) : PowerShell Core (pwsh) 経由でコマンドを実行する。"""
+    """start.pwsh(...) は PowerShell Core (pwsh) がインストールされていれば使用する。
+    未インストールの場合はエラーを返す（Debianに標準では入っていないため）。"""
     m = re.match(r'^start\.pwsh\((.*)\)$', left)
     cmdtext = sub_vars(strip_quotes(m.group(1).strip()))
+    pwsh_path = shutil.which('pwsh')
+    if not pwsh_path:
+        if target:
+            write_result("error", target)
+        else:
+            print("error: pwsh が見つかりません。'sudo apt install powershell' 等でインストールしてください")
+        return
     try:
         if target:
-            completed = subprocess.run(['pwsh', '-NoProfile', '-Command', cmdtext], capture_output=True, text=True)
+            completed = subprocess.run([pwsh_path, '-NoProfile', '-Command', cmdtext], capture_output=True, text=True)
             write_result(completed.stdout.rstrip('\n'), target)
         else:
-            subprocess.run(['pwsh', '-NoProfile', '-Command', cmdtext])
+            subprocess.run([pwsh_path, '-NoProfile', '-Command', cmdtext])
     except Exception:
         if target:
             write_result("error", target)
@@ -376,19 +416,27 @@ def handle_input(left, target):
         write_result(value, target)
 
 
+def _getch_posix():
+    """POSIX端末で1文字読み取る（msvcrt.getchのLinux代替）。"""
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return ch
+
+
 def handle_pause():
-    """Windows の msvcrt.getch() 相当を termios/tty で実現する。"""
     print("続行するには何かキーを押してください . . . ", end='', flush=True)
-    if sys.stdin.isatty():
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+    if termios and tty and sys.stdin.isatty():
         try:
-            tty.setraw(fd)
-            sys.stdin.read(1)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            _getch_posix()
+        except Exception:
+            input()
     else:
-        sys.stdin.readline()
+        input()
     print()
 
 
@@ -457,8 +505,10 @@ def execute_statement(line):
         handle_sleep(left)
     elif re.match(r'^random\s*=', left):
         handle_random(left, target)
-    elif left.startswith('req('):
-        handle_req(left, target)
+    elif re.match(r'^copy\s*\(', left):
+        handle_copy(left, target)
+    elif re.match(r'^unzip\(', left):
+        handle_unzip(left, target)
     elif re.match(r'^start\.file\(', left):
         handle_start_file(left, target)
     elif re.match(r'^start\.cmd\(', left):
