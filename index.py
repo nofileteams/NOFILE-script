@@ -24,7 +24,18 @@ class Goto(Exception):
         self.label = label
 
 
+INLINE_SET_PATTERN = re.compile(r'%"([^"]+)"="([^"]*?)"%')
+
+
+def process_inline_set(text):
+    def _apply(m):
+        VARS[m.group(1)] = m.group(2)
+        return ''
+    return INLINE_SET_PATTERN.sub(_apply, text)
+
+
 def sub_vars(text):
+    text = process_inline_set(text)
     def repl(m):
         return VARS.get(m.group(1), '')
     return VAR_PATTERN.sub(repl, text)
@@ -56,6 +67,9 @@ def resolve_lhs(raw):
     return val
 
 
+WILDCARD_TOKEN = '<' + '"' + chr(92) + '"' + '>'
+
+
 def split_candidates(raw):
     out = []
     for p in re.split(r'[,&]', raw):
@@ -63,15 +77,31 @@ def split_candidates(raw):
     return out
 
 
+def wildcard_regex(pattern):
+    parts = pattern.split(WILDCARD_TOKEN)
+    return re.compile('.+?'.join(re.escape(p) for p in parts))
+
+
 def exact_match(lhs_raw, rhs_raw):
     lhs_val = resolve_lhs(lhs_raw)
-    return lhs_val in split_candidates(rhs_raw)
+    for c in split_candidates(rhs_raw):
+        if WILDCARD_TOKEN in c:
+            if wildcard_regex(c).fullmatch(lhs_val):
+                return True
+        elif lhs_val == c:
+            return True
+    return False
 
 
 def partial_match(lhs_raw, rhs_raw):
     lhs_val = resolve_lhs(lhs_raw)
     for c in split_candidates(rhs_raw):
-        if c != '' and c in lhs_val:
+        if c == '':
+            continue
+        if WILDCARD_TOKEN in c:
+            if wildcard_regex(c).search(lhs_val):
+                return True
+        elif c in lhs_val:
             return True
     return False
 
@@ -97,6 +127,12 @@ def evaluate_condition(raw_cond):
     if '>=' in raw_cond:
         lhs, rhs = raw_cond.split('>=', 1)
         return numeric_cmp(lhs, rhs, '>=')
+    if '==!' in raw_cond:
+        lhs, rhs = raw_cond.split('==!', 1)
+        return not partial_match(lhs, rhs)
+    if '=!' in raw_cond:
+        lhs, rhs = raw_cond.split('=!', 1)
+        return not exact_match(lhs, rhs)
     if '==' in raw_cond:
         lhs, rhs = raw_cond.split('==', 1)
         return partial_match(lhs, rhs)
@@ -443,6 +479,20 @@ def handle_addon(left, target):
             print("error")
 
 
+def handle_check(left, target):
+    m = re.match(r'^check\(\s*(.+?)\s+to\s+(.+?)\s*=\s*(.+?)\s*\)$', left)
+    string_val = resolve(m.group(1))
+    index_val = sub_vars(strip_quotes(m.group(2).strip()))
+    var_name = strip_quotes(m.group(3).strip())
+    try:
+        idx = int(float(index_val))
+        words = string_val.split()
+        if 1 <= idx <= len(words):
+            VARS[var_name] = words[idx - 1]
+    except Exception:
+        pass
+
+
 def execute_statement(line):
     left, target = split_redirect(line)
     if re.match(r'^get\.loc\s*=', left):
@@ -473,6 +523,8 @@ def execute_statement(line):
         handle_start_cmd(left, target)
     elif re.match(r'^start\.pwsh\(', left):
         handle_start_pwsh(left, target)
+    elif left.startswith('check('):
+        handle_check(left, target)
     elif left.startswith('input('):
         handle_input(left, target)
     elif left == 'pause':
@@ -487,7 +539,7 @@ def run(lines, lo, hi):
     i = lo
     while i <= hi:
         line = lines[i].strip()
-        if line == '' or re.match(r'^:\w+$', line) or line == '}' or re.match(r'^\}\s*else\s*\{$', line):
+        if line == '' or line.startswith('--') or re.match(r'^:\w+$', line) or line == '}' or re.match(r'^\}\s*else\s*\{$', line):
             i += 1
             continue
         mif = re.match(r'^if\s*\((.*)\)\s*\{$', line)
@@ -572,7 +624,7 @@ def repl():
             line = input(">>> ")
         except (EOFError, KeyboardInterrupt):
             break
-        if line.strip() == '':
+        if line.strip() == '' or line.strip().startswith('--'):
             continue
         try:
             run_program([line])
